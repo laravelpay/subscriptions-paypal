@@ -53,7 +53,7 @@ class Gateway extends SubscriptionGateway
     private function createSubscription()
     {
         // Ensure a webhook is in place for receiving PayPal events
-//        $this->createWebhookUrl();
+        $this->createWebhookUrl();
 
         // If a PayPal plan ID is provided, use it; otherwise create a plan
         $planId = $this->subscription->data('paypal_plan_id') ?? $this->createPlan();
