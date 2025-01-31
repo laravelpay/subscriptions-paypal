@@ -10,40 +10,12 @@ use Illuminate\Http\Request;
 
 class Gateway extends SubscriptionGateway
 {
-    /**
-     * Unique identifier for this gateway.
-     *
-     * @var string
-     */
     protected string $identifier = 'paypal-subscriptions';
-
-    /**
-     * Gateway version.
-     *
-     * @var string
-     */
     protected string $version = '1.0.0';
-
-    /**
-     * Specify supported currencies. PayPalSubscriptions supports many, but we list a couple here.
-     *
-     * @var array
-     */
     protected array $currencies = [];
 
-    /**
-     * The subscription instance.
-     *
-     * @var \LaraPay\Framework\Subscription
-     */
     protected $subscription;
 
-    /**
-     * Define the gateway configuration fields
-     * that are required for PayPal's API.
-     *
-     * @return array
-     */
     public function config(): array
     {
         return [
@@ -70,12 +42,7 @@ class Gateway extends SubscriptionGateway
     }
 
     /**
-     * Create a payment on PayPalSubscriptions and redirect the user to the PayPalSubscriptions checkout page.
-     *
-     * @param  \LaraPay\Framework\Subscription  $subscription
-     * @return \Illuminate\Http\RedirectResponse
-     *
-     * @throws \Exception
+     * Main entry point for creating a subscription and redirecting to PayPal.
      */
     public function subscribe($subscription)
     {
@@ -85,36 +52,26 @@ class Gateway extends SubscriptionGateway
 
     private function createSubscription()
     {
-        $this->createWebhookUrl();
+        // Ensure a webhook is in place for receiving PayPal events
+//        $this->createWebhookUrl();
 
-        if($this->subscription->data('paypal_plan_id')) {
-            // If the plan id is passed, we use that
-            $planId = $this->subscription->data('paypal_plan_id');
-        } else {
-            // If plan id is not passed, we create a new plan
-            $planId = $this->createPlan();
-        }
-
-        if(!$planId)
-        {
+        // If a PayPal plan ID is provided, use it; otherwise create a plan
+        $planId = $this->subscription->data('paypal_plan_id') ?? $this->createPlan();
+        if (!$planId) {
             throw new \Exception('Failed to create plan');
         }
 
-        // Create the subscription
-        $subscription = $this->createPaypalSubscription($planId);
+        // Create the actual PayPal subscription
+        $payPalSub = $this->createPaypalSubscription($planId);
+        $this->subscription->update(['subscription_id' => $payPalSub['id']]);
 
-        // store the subscription id for future reference
-        $this->subscription->update([
-            'subscription_id' => $subscription['id'],
-        ]);
-
-        if (!$subscription || !isset($subscription['links'])) {
+        if (!isset($payPalSub['links'])) {
             throw new \Exception('Failed to create subscription');
         }
 
-        foreach ($subscription['links'] as $link) {
+        // Redirect user to the "approve" link
+        foreach ($payPalSub['links'] as $link) {
             if ($link['rel'] === 'approve') {
-                // Redirect user to PayPal for approval
                 return redirect($link['href']);
             }
         }
@@ -124,99 +81,68 @@ class Gateway extends SubscriptionGateway
 
     protected function createPlan()
     {
-        $subscription = $this->subscription;
         $product = $this->createProduct();
-        $accessToken = $this->getAccessToken();
-        $period = $this->getOptimalInterval($subscription->frequency);
+        $interval = $this->getOptimalInterval($this->subscription->frequency);
 
-        $paymentPreference = [
-            "auto_bill_outstanding" => true,
-            "setup_fee_failure_action" => "CONTINUE",
-            "payment_failure_threshold" => 3
-        ];
-
-        $response = Http::withToken($accessToken)
-            ->post($this->apiEndpoint('/billing/plans'), [
-                "product_id" => $product['id'],
-                "name" => $subscription->name,
-                "billing_cycles" => [
-                    [
-                        "frequency" => [
-                            "interval_unit" => $period['interval'],
-                            "interval_count" => $period['frequency'],
-                        ],
-                        "tenure_type" => "REGULAR",
-                        "sequence" => 1,
-                        "total_cycles" => 0, // 0 means it keeps renewing until canceled
-                        "pricing_scheme" => [
-                            "fixed_price" => [
-                                "value" => $subscription->amount,
-                                "currency_code" => $subscription->currency,
-                            ]
+        $plan = $this->paypalRequest('post', '/billing/plans', [
+            "product_id" => $product['id'],
+            "name"       => $this->subscription->name,
+            "billing_cycles" => [
+                [
+                    "frequency" => [
+                        "interval_unit"  => $interval['interval'],
+                        "interval_count" => $interval['frequency'],
+                    ],
+                    "tenure_type"   => "REGULAR",
+                    "sequence"      => 1,
+                    "total_cycles"  => 0, // infinite
+                    "pricing_scheme" => [
+                        "fixed_price" => [
+                            "value"         => $this->subscription->amount,
+                            "currency_code" => $this->subscription->currency,
                         ]
                     ]
-                ],
-                "payment_preferences" => $paymentPreference,
-            ]);
+                ]
+            ],
+            "payment_preferences" => [
+                "auto_bill_outstanding"      => true,
+                "setup_fee_failure_action"   => "CONTINUE",
+                "payment_failure_threshold"  => 3
+            ],
+        ]);
 
-        if ($response->failed()) {
-            return throw new \Exception('Failed to create plan');
-        }
-
-        $plan = $response->json();
         return $plan['id'] ?? null;
     }
 
     protected function createPaypalSubscription($planId)
     {
-        $accessToken = $this->getAccessToken();
-        $subscription = $this->subscription;
-
-        $response = Http::withToken($accessToken)
-            ->post($this->apiEndpoint('/billing/subscriptions'), [
-                "plan_id" => $planId,
-                'custom_id' => $subscription->id,
-                "application_context" => [
-                    "return_url" => route('larapay.webhook', ['gateway_id' => 'paypal-subscriptions', 'ppl_return_url' => $subscription->id]),
-                    "cancel_url" => $subscription->cancelUrl(),
-                ]
-            ]);
-
-        if ($response->failed()) {
-            throw new \Exception('Failed to create subscription');
-        }
-
-        return $response->json();
+        return $this->paypalRequest('post', '/billing/subscriptions', [
+            "plan_id"   => $planId,
+            "custom_id" => $this->subscription->id,
+            "application_context" => [
+                "return_url" => route('larapay.webhook', [
+                    'gateway_id'    => 'paypal-subscriptions',
+                    'ppl_return_url'=> $this->subscription->id
+                ]),
+                "cancel_url" => $this->subscription->cancelUrl(),
+            ]
+        ]);
     }
 
     protected function createProduct()
     {
-        $accessToken = $this->getAccessToken();
-        $response = Http::withToken($accessToken)
-            ->post($this->apiEndpoint('/catalogs/products'), [
-                "name" => $this->subscription->name,
-                "type" => "DIGITAL",
-                "category" => "SOFTWARE",
-            ]);
-
-        if ($response->failed()) {
-            return throw new \Exception('Failed to create product');
-        }
-
-        $product = $response->json();
-        return $product;
+        return $this->paypalRequest('post', '/catalogs/products', [
+            "name"     => $this->subscription->name,
+            "type"     => "DIGITAL",
+            "category" => "SOFTWARE",
+        ]);
     }
 
     /**
-     * Determine the most optimal interval (day, week, month, year)
-     * such that $days is divisible by that interval's day-equivalent.
-     *
-     * @param  int  $days
-     * @return array  [<count> => <interval>]
+     * Helps find an interval (DAY, WEEK, MONTH, YEAR) that evenly divides $days.
      */
     private function getOptimalInterval(int $days): array
     {
-        // Define the interval mapping in descending order by day-equivalent.
         $intervals = [
             365 => 'YEAR',
             30  => 'MONTH',
@@ -224,75 +150,63 @@ class Gateway extends SubscriptionGateway
             1   => 'DAY',
         ];
 
-        // Check from largest to smallest interval to find a clean divisor
+        // Pick the largest interval that cleanly divides $days
         foreach ($intervals as $dayEquivalent => $label) {
-            // If $days is exactly divisible by the day-equivalent,
-            // that is our optimal interval.
             if ($days % $dayEquivalent === 0) {
-                $count = $days / $dayEquivalent;  // e.g. 90/30 = 3 => 'MONTH'
-                return ['frequency' => $count, 'interval' => $label];
+                return [
+                    'frequency' => $days / $dayEquivalent,
+                    'interval'  => $label
+                ];
             }
         }
 
-        // fallback to default interval
+        // Fallback (shouldn't usually happen unless you have weird intervals)
         return ['frequency' => 1, 'interval' => 'MONTH'];
     }
 
+    /**
+     * Checks if a webhook already exists. If not, creates it.
+     */
     private function createWebhookUrl()
     {
         $gateway = $this->subscription->gateway;
+        $key = $this->isSandboxMode() ? 'sandbox_webhook_id' : 'live_webhook_id';
 
-        // if webhook already exists, return it
-        if($this->isSandboxMode() && $gateway->config('sandbox_webhook_id')) {
-            return $gateway->config('sandbox_webhook_id');
-        } elseif(!$this->isSandboxMode() && $gateway->config('live_webhook_id')) {
-            return $gateway->config('live_webhook_id');
+        // If we already have a webhook ID stored, return it
+        if ($gateway->config($key)) {
+            return $gateway->config($key);
         }
 
-        $accessToken = $this->getAccessToken();
+        // Otherwise, create a new webhook
+        $webhook = $this->paypalRequest('post', '/notifications/webhooks', [
+            "url" => route('larapay.webhook', [
+                'gateway_id' => 'paypal-subscriptions',
+                'unique_gc'  => $gateway->id
+            ]),
+            "event_types" => [
+                ["name" => "BILLING.SUBSCRIPTION.ACTIVATED"],
+                ["name" => "BILLING.SUBSCRIPTION.CANCELLED"],
+                ["name" => "BILLING.SUBSCRIPTION.EXPIRED"],
+                ["name" => "BILLING.SUBSCRIPTION.RE-ACTIVATED"],
+                ["name" => "BILLING.SUBSCRIPTION.SUSPENDED"],
+                ["name" => "PAYMENT.SALE.COMPLETED"],
+            ],
+        ]);
 
-        $response = Http::withToken($accessToken)
-            ->post($this->apiEndpoint('/notifications/webhooks'), [
-                "url" => route('larapay.webhook', ['gateway_id' => 'paypal-subscriptions', 'unique_gc' => $gateway->id]),
-                "event_types" => [
-                    ['name' => 'BILLING.SUBSCRIPTION.ACTIVATED'],
-                    ['name' => 'BILLING.SUBSCRIPTION.CANCELLED'],
-                    ['name' => 'BILLING.SUBSCRIPTION.EXPIRED'],
-                    ['name' => 'BILLING.SUBSCRIPTION.RE-ACTIVATED'],
-                    ['name' => 'BILLING.SUBSCRIPTION.SUSPENDED'],
-                    ['name' => 'PAYMENT.SALE.COMPLETED'],
-                ],
-            ]);
-
-        if ($response->failed()) {
-            throw new \Exception('Failed to create webhook');
-        }
-
-        $webhook = $response->json();
-
-        if($this->isSandboxMode())
-        {
-            $gateway->config['sandbox_webhook_id'] = $webhook['id'];
-            $gateway->save();
-            return $webhook['id'];
-        }
-
-        $gateway->config['live_webhook_id'] = $webhook['id'];
+        $gateway->config[$key] = $webhook['id'];
         $gateway->save();
 
         return $webhook['id'];
     }
 
-    private function getWebhookId()
-    {
-        return $this->createWebhookUrl();
-    }
-
+    /**
+     * Get or cache an access token from PayPal for subsequent calls.
+     */
     private function getAccessToken()
     {
         return Cache::remember('larapay:paypal_subscriptions_access_token', 60, function () {
-            $gateway = $this->subscription->gateway;
-            $clientId = $gateway->config('client_id');
+            $gateway      = $this->subscription->gateway;
+            $clientId     = $gateway->config('client_id');
             $clientSecret = $gateway->config('client_secret');
 
             $response = Http::withBasicAuth($clientId, $clientSecret)
@@ -316,7 +230,9 @@ class Gateway extends SubscriptionGateway
 
     private function apiUrl()
     {
-        return $this->isSandboxMode() ? 'https://api-m.sandbox.paypal.com/v1' : 'https://api-m.paypal.com/v1';
+        return $this->isSandboxMode()
+            ? 'https://api-m.sandbox.paypal.com/v1'
+            : 'https://api-m.paypal.com/v1';
     }
 
     private function apiEndpoint($path = '')
@@ -325,82 +241,88 @@ class Gateway extends SubscriptionGateway
     }
 
     /**
-     * Handle asynchronous callbacks (webhooks) from  .
-     * Mollie calls this endpoint whenever the payment status changes.
-     *
-     * @param  \Illuminate\Http\Request  $request
-     * @return void
-     *
-     * @throws \Exception
+     * Generic helper to send a request to PayPal and throw if it fails.
+     */
+    private function paypalRequest(string $method, string $path, array $data = [])
+    {
+        $response = Http::withToken($this->getAccessToken())->$method($this->apiEndpoint($path), $data);
+
+        if ($response->failed()) {
+            throw new \Exception(
+                "PayPal $method $path failed: " . $response->body()
+            );
+        }
+
+        return $response->json();
+    }
+
+    /**
+     * Handle the callback when PayPal redirects back or sends a webhook.
      */
     public function callback(Request $request)
     {
-        // when the user is redirected back from PayPal, PayPal includes the subscription id in the query string
-        // We use that to make an API call to paypal to check the status of the subscription and activate it
-        if($request->has('ppl_return_url')) {
+        // If redirected from PayPal (with ?ppl_return_url=...)
+        if ($request->has('ppl_return_url')) {
             $subscription = Subscription::find($request->get('ppl_return_url'));
 
-            if(!$subscription) {
+            if (!$subscription) {
                 throw new \Exception('Subscription not found');
             }
 
             $this->subscription = $subscription;
-            $subscriptionId = $subscription->subscription_id;
-            $accessToken = $this->getAccessToken();
-            $response = Http::withToken($accessToken)
-                ->get($this->apiEndpoint('/billing/subscriptions/' . $subscriptionId));
+            $subData = $this->paypalRequest('get', '/billing/subscriptions/' . $subscription->subscription_id);
 
-            if ($response->success() AND isset($response->json()['status']) AND $response->json()['status'] === 'ACTIVE') {
-                $subscription->activate($subscriptionId, $response->json());
+            dd($subData);
 
-                // we redirect the user to the success url
+            if (($subData['status'] ?? null) === 'ACTIVE') {
+                $subscription->activate($subscription->subscription_id, $subData);
                 return redirect($subscription->successUrl());
             }
         }
 
-        // otherwise, we handle the webhook event
+        // Otherwise, it's a webhook
         return $this->handleCallback($request);
     }
 
+    /**
+     * Process PayPal's webhook events asynchronously.
+     */
     private function handleCallback(Request $request)
     {
-        // if request doesnt contain event type, then return an json response
         if (!$request->has('event_type')) {
-            return throw new \Exception('Unexpected Payload');
+            throw new \Exception('Unexpected Payload');
         }
 
-        // Retrieve all event data
-        $event = $request->all();
-        $eventType = $event['event_type'] ?? null;
-
-        // Step 1: Verify the webhook to ensure authenticity
+        // Verify PayPal's signature
         $this->verifyPaypalWebhook($request);
 
-        // Step 2: Process the event only if verification passed
+        $eventType  = $request->input('event_type');
+        $resource   = $request->input('resource') ?? [];
+        $customId   = $resource['custom_id'] ?? null;
+        $subId      = $resource['id'] ?? null;
+
+        // Handle relevant subscription events
         if (in_array($eventType, [
             'BILLING.SUBSCRIPTION.ACTIVATED',
             'BILLING.SUBSCRIPTION.CANCELLED',
             'BILLING.SUBSCRIPTION.EXPIRED',
-            // ... other subscription events you care about
         ])) {
-            $subscriptionData = $event['resource'];
-            $customId = $subscriptionData['custom_id'] ?? null;
-            $subscriptionId = $subscriptionData['id'] ?? null;
+            if ($customId && $eventType === 'BILLING.SUBSCRIPTION.ACTIVATED') {
+                $subscription = Subscription::find($customId);
 
-            if ($customId) {
-                if($eventType === 'BILLING.SUBSCRIPTION.ACTIVATED') {
-                    $subscription = Subscription::find($customId);
-
-                    if ($subscription) {
-                        $subscription->activate(
-                            $subscriptionId,
-                            $request->json(),
-                        );
-                    }
-
-                } else if ($eventType === 'BILLING.SUBSCRIPTION.CANCELLED') {
-                    // Handle cancellation logic here
+                if(!$subscription) {
+                    throw new \Exception('Subscription not found');
                 }
+
+                if($subscription->isActive()) {
+                    return;
+                }
+
+                if ($subscription) {
+                    $subscription->activate($subId, $request->json());
+                }
+            } elseif ($customId && $eventType === 'BILLING.SUBSCRIPTION.CANCELLED') {
+                // Handle your cancellation logic
             }
         }
 
@@ -408,73 +330,48 @@ class Gateway extends SubscriptionGateway
     }
 
     /**
-     * Verifies that the received webhook event is genuinely from PayPal.
+     * Verify PayPal's webhook signature to ensure authenticity.
      */
     private function verifyPaypalWebhook(Request $request)
     {
-        // Prepare data for verification
-        $webhookId = $this->getWebhookId();
-        $verificationData = [
+        $webhookId  = $this->createWebhookUrl(); // ensures we have a valid Webhook ID
+        $verification = $this->paypalRequest('post', '/notifications/verify-webhook-signature', [
             'auth_algo'         => $request->header('PAYPAL-AUTH-ALGO'),
             'cert_url'          => $request->header('PAYPAL-CERT-URL'),
             'transmission_id'   => $request->header('PAYPAL-TRANSMISSION-ID'),
             'transmission_sig'  => $request->header('PAYPAL-TRANSMISSION-SIG'),
             'transmission_time' => $request->header('PAYPAL-TRANSMISSION-TIME'),
             'webhook_id'        => $webhookId,
-            'webhook_event'     => $request->json()->all()
-        ];
+            'webhook_event'     => $request->json()->all(),
+        ]);
 
-        // Send request to PayPal to verify signature
-        $accessToken = $this->getAccessToken();
-        $response = Http::withToken($accessToken)
-            ->post($this->apiEndpoint('/notifications/verify-webhook-signature'), $verificationData);
-
-        if ($response->failed()) {
+        if (($verification['verification_status'] ?? null) !== 'SUCCESS') {
             throw new \Exception('Failed to verify webhook signature');
         }
-
-        if($response->json('verification_status') !== 'SUCCESS') {
-            throw new \Exception('Failed to verify webhook signature');
-        }
-
-        return true;
     }
 
+    /**
+     * Check if a subscription is still ACTIVE on PayPal.
+     */
     public function checkSubscription($subscription): bool
     {
-        $accessToken = $this->getAccessToken();
-        $subscriptionId = $subscription->subscription_id;
+        $subData = $this->paypalRequest('get', '/billing/subscriptions/' . $subscription->subscription_id);
 
-        $response = Http::withToken($accessToken)
-            ->get($this->apiEndpoint('/billing/subscriptions/' . $subscriptionId));
-
-        if ($response->failed()) {
+        if (!isset($subData['status'])) {
             throw new \Exception('Failed to check subscription');
         }
 
-        $subscription = $response->json();
-
-        if(!isset($subscription['status']))
-        {
-            throw new \Exception('Failed to check subscription');
-        }
-
-        return $subscription['status'] === 'ACTIVE';
+        return $subData['status'] === 'ACTIVE';
     }
 
+    /**
+     * Cancel a subscription on PayPal.
+     */
     public function cancelSubscription($subscription): bool
     {
-        $accessToken = $this->getAccessToken();
-        $subscriptionId = $subscription->subscription_id;
-
-        $response = Http::withToken($accessToken)
-            ->post($this->apiEndpoint('/billing/subscriptions/' . $subscriptionId . '/cancel'), [
-                'reason' => 'User canceled subscription',
-            ]);
-
-        if ($response->failed()) {
-            throw new \Exception('Failed to cancel subscription');
-        }
+        $this->paypalRequest('post', '/billing/subscriptions/' . $subscription->subscription_id . '/cancel', [
+            'reason' => 'User canceled subscription',
+        ]);
 
         return true;
     }
