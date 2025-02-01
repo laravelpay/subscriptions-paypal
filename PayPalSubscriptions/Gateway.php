@@ -120,10 +120,7 @@ class Gateway extends SubscriptionGateway
             "plan_id"   => $planId,
             "custom_id" => $this->subscription->id,
             "application_context" => [
-                "return_url" => route('larapay.webhook', [
-                    'gateway_id'    => 'paypal-subscriptions',
-                    'ppl_return_url'=> $this->subscription->id
-                ]),
+                "return_url" => $this->subscription->callbackUrl(),
                 "cancel_url" => $this->subscription->cancelUrl(),
             ]
         ]);
@@ -181,7 +178,7 @@ class Gateway extends SubscriptionGateway
         $webhook = $this->paypalRequest('post', '/notifications/webhooks', [
             "url" => route('larapay.webhook', [
                 'gateway_id' => 'paypal-subscriptions',
-                'unique_gc'  => $gateway->id
+                'unique_gw'  => $gateway->id
             ]),
             "event_types" => [
                 ["name" => "BILLING.SUBSCRIPTION.ACTIVATED"],
@@ -261,44 +258,44 @@ class Gateway extends SubscriptionGateway
      */
     public function callback(Request $request)
     {
-        // If redirected from PayPal (with ?ppl_return_url=...)
-        if ($request->has('ppl_return_url')) {
-            $subscription = Subscription::find($request->get('ppl_return_url'));
+        $subscription = Subscription::find($request->get('subscription_id'));
 
-            if (!$subscription) {
-                throw new \Exception('Subscription not found');
-            }
-
-            $this->subscription = $subscription;
-            $subData = $this->paypalRequest('get', '/billing/subscriptions/' . $subscription->subscription_id);
-
-            dd($subData);
-
-            if (($subData['status'] ?? null) === 'ACTIVE') {
-                $subscription->activate($subscription->subscription_id, $subData);
-                return redirect($subscription->successUrl());
-            }
+        if (!$subscription) {
+            throw new \Exception('Subscription not found');
         }
 
-        // Otherwise, it's a webhook
-        return $this->handleCallback($request);
+        $this->subscription = $subscription;
+        $subData = $this->paypalRequest('get', '/billing/subscriptions/' . $subscription->subscription_id);
+
+        if (($subData['status'] ?? null) === 'ACTIVE') {
+            $subscription->activate($subscription->subscription_id, $subData);
+            return redirect($subscription->successUrl());
+        }
     }
 
     /**
      * Process PayPal's webhook events asynchronously.
      */
-    private function handleCallback(Request $request)
+    private function webhook(Request $request)
     {
         if (!$request->has('event_type')) {
             throw new \Exception('Unexpected Payload');
         }
+
+        $customId   = $resource['custom_id'] ?? null;
+        $subscription = Subscription::find($customId);
+
+        if(!$subscription) {
+            throw new \Exception('Subscription not found');
+        }
+
+        $this->subscription = $subscription;
 
         // Verify PayPal's signature
         $this->verifyPaypalWebhook($request);
 
         $eventType  = $request->input('event_type');
         $resource   = $request->input('resource') ?? [];
-        $customId   = $resource['custom_id'] ?? null;
         $subId      = $resource['id'] ?? null;
 
         // Handle relevant subscription events
@@ -308,12 +305,6 @@ class Gateway extends SubscriptionGateway
             'BILLING.SUBSCRIPTION.EXPIRED',
         ])) {
             if ($customId && $eventType === 'BILLING.SUBSCRIPTION.ACTIVATED') {
-                $subscription = Subscription::find($customId);
-
-                if(!$subscription) {
-                    throw new \Exception('Subscription not found');
-                }
-
                 if($subscription->isActive()) {
                     return;
                 }
