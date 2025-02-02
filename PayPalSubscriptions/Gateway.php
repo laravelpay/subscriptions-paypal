@@ -258,7 +258,7 @@ class Gateway extends SubscriptionGateway
      */
     public function callback(Request $request)
     {
-        $subscription = Subscription::find($request->get('subscription_id'));
+        $subscription = Subscription::where('token', $request->get('subscription_token'));
 
         if (!$subscription) {
             throw new \Exception('Subscription not found');
@@ -269,8 +269,9 @@ class Gateway extends SubscriptionGateway
 
         if (($subData['status'] ?? null) === 'ACTIVE') {
             $subscription->activate($subscription->subscription_id, $subData);
-            return redirect($subscription->successUrl());
         }
+
+        return redirect($subscription->successUrl());
     }
 
     /**
